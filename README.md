@@ -224,7 +224,14 @@ end)
 
 **ConnectSafe**
 ````
-connection = safe:ConnectSafe(signal: RBXScriptSignal, callback: function, weakRef?: Instance)
+connection = safe:ConnectSafe(
+	signal: RBXScriptSignal,
+	callback: (...any) -> (),
+	options: {
+		weakRef: Instance?,
+		usePromise: boolean?
+	}?
+)
 ````
 Safely connects to Roblox events/signals with automatic error handling and optional weak reference disconnect.
 **Use case**: Safely connects to events/signals.
@@ -232,9 +239,30 @@ Safely connects to Roblox events/signals with automatic error handling and optio
 
 ## Example
 ```
+Baisc
 safe:ConnectSafe(part.Touched, function(hit)
 	print("Touched:", hit)
+	error("Test error") -- will be caught and logged
 end)
+
+With weakRef
+safe:ConnectSafe(button.MouseButton1Click, function()
+	print("Button clicked")
+end, {
+	weakRef = button,
+})
+
+
+With Promise mode
+safe:SetPromiseModule(Promise)
+
+safe:ConnectSafe(remote.OnClientEvent, function(data)
+	print("Got data:", data)
+	error("Promise test")
+end, {
+	usePromise = true,
+})
+
 ```
 
 **Memoize**
