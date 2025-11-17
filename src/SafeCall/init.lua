@@ -1,26 +1,23 @@
 --[[
-	Author: Akira
-	SafeCall v1.2
-	Lightweight fail-safe wrapper for unsafe function calls
-	
-	Features:
-	• Automatic error handling with pcall
-	• Retry mechanisms with configurable attempts
-	• Promise-based async calls
-	• Table function protection
-	• RemoteEvent/RemoteFunction wrappers
-	• Custom logging support
-	• Circuit breaker pattern
-	• Rate limiting
-	• Memory-safe connections
-	• Memoization with TTL
-	• Performance profiling
-	• Global error handlers
-	• Promise Support
-	• Context Tags
-	• Error Filtering
-	• Dynamic Retry
-	• Safe Task Scheduler
+    Author: Akira
+    SafeCall v1.2
+    Lightweight fail-safe wrapper for unsafe function calls
+
+    Features:
+    • Automatic error handling with pcall
+    • Retry mechanisms with configurable attempts
+    • Promise-based async calls (via SetPromiseModule)
+    • Table function protection
+    • RemoteEvent/RemoteFunction/Bindable wrappers
+    • Custom logging support
+    • Circuit breaker pattern
+    • Rate limiting
+    • Memory-safe connections
+    • Memoization with TTL
+    • Performance profiling
+    • Global error handlers
+    • Context tags & error filtering
+    • Dynamic retry & safe task scheduler
 --]]
 
 local SafeCall = {}
@@ -28,28 +25,27 @@ SafeCall.__index = SafeCall
 
 local RunService = game:GetService("RunService")
 
-local ok, Promise = pcall(function()
-	return require(game:GetService("ReplicatedStorage").Main.Frameworks.Packages.Promise)
-end)
-if not ok then Promise = nil end
-
 SafeCall._globalHandlers = {}
 SafeCall._errorFilters = {}
 SafeCall._taskScheduler = {}
 SafeCall._retryHandler = nil
 
 function SafeCall.new(logFunction)
-	local instance = {
-		Log = logFunction or function(err)
-			warn("[SafeCall]:", err)
-		end,
-		_retryDefaults = {
-			attempts = 3,
-			delay = 0.1,
-			backoff = 1.5
-		}
+	local self = setmetatable({}, SafeCall)
+
+	self.Log = logFunction or function(err)
+		warn("[SafeCall]:", err)
+	end
+
+	self._retryDefaults = {
+		attempts = 3,
+		delay = 0.1,
+		backoff = 1.5,
 	}
-	return setmetatable(instance, SafeCall)
+
+	self.Promise = nil
+
+	return self
 end
 
 function SafeCall.call(fn, ...)
@@ -69,7 +65,7 @@ function SafeCall:SetRetryDefaults(attempts, delay, backoff)
 	self._retryDefaults = {
 		attempts = attempts or 3,
 		delay = delay or 0.1,
-		backoff = backoff or 1.5
+		backoff = backoff or 1.5,
 	}
 	return self
 end
@@ -85,17 +81,19 @@ end
 function SafeCall:Call(fn, contextTag, ...)
 	local success, result = pcall(fn, ...)
 	if not success then
+		local msg = tostring(result)
+
 		for _, pattern in ipairs(SafeCall._errorFilters) do
-			if string.match(result, pattern) then
+			if string.match(msg, pattern) then
 				return success, result -- Ignore filtered error
 			end
 		end
 
 		local context = contextTag and ("[" .. contextTag .. "] ") or ""
-		self.Log(context .. result)
+		self.Log(context .. msg)
 
 		for _, handler in ipairs(SafeCall._globalHandlers) do
-			pcall(handler, result, debug.traceback(), contextTag)
+			pcall(handler, msg, debug.traceback(), contextTag)
 		end
 	end
 	return success, result
@@ -105,10 +103,10 @@ function SafeCall:CallWithRetry(fn, attempts, delay, backoff, ...)
 	attempts = attempts or self._retryDefaults.attempts
 	delay = delay or self._retryDefaults.delay
 	backoff = backoff or self._retryDefaults.backoff
-	
-	local args = {...}
+
+	local args = { ... }
 	local currentDelay = delay
-	
+
 	for i = 1, attempts do
 		local success, result = pcall(fn, table.unpack(args))
 		if success then return true, result end
@@ -117,7 +115,8 @@ function SafeCall:CallWithRetry(fn, attempts, delay, backoff, ...)
 			break
 		end
 
-		self.Log(`[Retry {i}/{attempts}] {result}`)
+		self.Log(string.format("[Retry %d/%d] %s", i, attempts, tostring(result)))
+
 		if i < attempts then
 			task.wait(currentDelay)
 			currentDelay = currentDelay * backoff
@@ -150,14 +149,14 @@ function SafeCall:CallAsync(fn, ...)
 end
 
 function SafeCall:CallDeferred(fn, ...)
-	local args = {...}
+	local args = { ... }
 	task.defer(function()
 		self:Call(fn, table.unpack(args))
 	end)
 end
 
 function SafeCall:CallDelayed(delay, fn, ...)
-	local args = {...}
+	local args = { ... }
 	task.wait(delay)
 	return self:Call(fn, table.unpack(args))
 end
@@ -182,16 +181,16 @@ function SafeCall:WrapEvent(remote, callback)
 	if remote:IsA("RemoteEvent") then
 		if RunService:IsServer() then
 			return remote.OnServerEvent:Connect(function(player, ...)
-				self:Call(callback, player, ...)
+				self:Call(callback, nil, player, ...)
 			end)
 		else
 			return remote.OnClientEvent:Connect(function(...)
-				self:Call(callback, ...)
+				self:Call(callback, nil, ...)
 			end)
 		end
 	elseif remote:IsA("BindableEvent") then
 		return remote.Event:Connect(function(...)
-			self:Call(callback, ...)
+			self:Call(callback, nil, ...)
 		end)
 	else
 		error("Expected RemoteEvent or BindableEvent")
@@ -204,18 +203,18 @@ function SafeCall:WrapFunction(remote, callback)
 	if remote:IsA("RemoteFunction") then
 		if RunService:IsServer() then
 			remote.OnServerInvoke = function(player, ...)
-				local success, result = self:Call(callback, player, ...)
+				local success, result = self:Call(callback, nil, player, ...)
 				return success and result or nil
 			end
 		else
 			remote.OnClientInvoke = function(...)
-				local success, result = self:Call(callback, ...)
+				local success, result = self:Call(callback, nil, ...)
 				return success and result or nil
 			end
 		end
 	elseif remote:IsA("BindableFunction") then
 		remote.OnInvoke = function(...)
-			local success, result = self:Call(callback, ...)
+			local success, result = self:Call(callback, nil, ...)
 			return success and result or nil
 		end
 	else
@@ -226,18 +225,18 @@ end
 function SafeCall:CallBatch(functions)
 	local results = {}
 	for i, fn in ipairs(functions) do
-		results[i] = {self:Call(fn)}
+		results[i] = { self:Call(fn) }
 	end
 	return results
 end
 
 function SafeCall:CallWithTimeout(timeout, fn, ...)
-	local args = {...}
+	local args = { ... }
 	local completed = false
 	local result
 
 	task.spawn(function()
-		result = {self:Call(fn, table.unpack(args))}
+		result = { self:Call(fn, nil, table.unpack(args)) }
 		completed = true
 	end)
 
@@ -260,7 +259,7 @@ function SafeCall:CreateCircuitBreaker(threshold, resetTime)
 		threshold = threshold or 5,
 		resetTime = resetTime or 30,
 		lastFailure = 0,
-		state = "CLOSED" -- CLOSED, OPEN, HALF_OPEN
+		state = "CLOSED", -- CLOSED, OPEN, HALF_OPEN
 	}
 end
 
@@ -277,7 +276,7 @@ function SafeCall:CallWithCircuitBreaker(breaker, fn, ...)
 		return false, "Circuit breaker open"
 	end
 
-	local success, result = self:Call(fn, ...)
+	local success, result = self:Call(fn, nil, ...)
 
 	if success then
 		if breaker.state == "HALF_OPEN" then
@@ -289,8 +288,8 @@ function SafeCall:CallWithCircuitBreaker(breaker, fn, ...)
 		breaker.lastFailure = now
 
 		if breaker.failures >= breaker.threshold then
+			self.Log(string.format("Circuit breaker OPENED after %d failures", breaker.failures))
 			breaker.state = "OPEN"
-			self.Log(`Circuit breaker OPENED after {breaker.failures} failures`)
 		end
 	end
 
@@ -301,7 +300,7 @@ function SafeCall:CreateRateLimiter(maxCalls, timeWindow)
 	return {
 		calls = {},
 		maxCalls = maxCalls or 10,
-		timeWindow = timeWindow or 60
+		timeWindow = timeWindow or 60,
 	}
 end
 
@@ -320,7 +319,7 @@ function SafeCall:CallWithRateLimit(limiter, fn, ...)
 	end
 
 	table.insert(limiter.calls, now)
-	return self:Call(fn, ...)
+	return self:Call(fn, nil, ...)
 end
 
 function SafeCall:ConnectSafe(signal, callback, options)
@@ -369,18 +368,24 @@ function SafeCall:Memoize(fn, ttl)
 	ttl = ttl or math.huge
 
 	return function(...)
-		local key = table.concat({...}, "_")
+		local rawArgs = { ... }
+		local parts = {}
+		for i, v in ipairs(rawArgs) do
+			parts[i] = typeof(v) .. ":" .. tostring(v)
+		end
+
+		local key = table.concat(parts, "|")
 		local entry = cache[key]
 
 		if entry and (tick() - entry.time) < ttl then
 			return entry.success, entry.result
 		end
 
-		local success, result = self:Call(fn, ...)
+		local success, result = self:Call(fn, nil, table.unpack(rawArgs))
 		cache[key] = {
 			success = success,
 			result = result,
-			time = tick()
+			time = tick(),
 		}
 
 		return success, result
@@ -393,25 +398,25 @@ function SafeCall:CreateProfiler()
 		totalTime = 0,
 		errors = 0,
 		slowCalls = 0,
-		slowThreshold = 0.1
+		slowThreshold = 0.1,
 	}
 end
 
 function SafeCall:CallWithProfiler(profiler, fn, ...)
 	local start = tick()
-	profiler.calls = profiler.calls + 1
+	profiler.calls += 1
 
-	local success, result = self:Call(fn, ...)
+	local success, result = self:Call(fn, nil, ...)
 
 	local duration = tick() - start
-	profiler.totalTime = profiler.totalTime + duration
+	profiler.totalTime += duration
 
 	if not success then
-		profiler.errors = profiler.errors + 1
+		profiler.errors += 1
 	end
 
 	if duration > profiler.slowThreshold then
-		profiler.slowCalls = profiler.slowCalls + 1
+		profiler.slowCalls += 1
 	end
 
 	return success, result
@@ -424,7 +429,7 @@ function SafeCall:GetProfilerStats(profiler)
 		errorRate = profiler.calls > 0 and (profiler.errors / profiler.calls) or 0,
 		avgTime = profiler.calls > 0 and (profiler.totalTime / profiler.calls) or 0,
 		slowCalls = profiler.slowCalls,
-		slowCallRate = profiler.calls > 0 and (profiler.slowCalls / profiler.calls) or 0
+		slowCallRate = profiler.calls > 0 and (profiler.slowCalls / profiler.calls) or 0,
 	}
 end
 
@@ -442,7 +447,10 @@ function SafeCall:RemoveGlobalHandler(handler)
 end
 
 function SafeCall:Schedule(name, interval, fn)
-	if SafeCall._taskScheduler[name] then return end -- prevent duplicate
+	if SafeCall._taskScheduler[name] then
+		return
+	end
+
 	SafeCall._taskScheduler[name] = true
 
 	task.spawn(function()
