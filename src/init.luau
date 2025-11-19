@@ -2,8 +2,8 @@
 	Name: SafeCall
 	Description: Lightweight fail-safe wrapper for unsafe function calls
 	Repository: text21/SafeCall
-    Author: Akira
-    Version: 1.2.0
+	Author: Akira
+	Version: 1.3.0
 --]]
 
 local SafeCall = {}
@@ -57,7 +57,7 @@ function SafeCall:SetRetryHandler(fn)
 end
 
 function SafeCall:Call(fn, ...)
-	local results = {pcall(fn, ...)}
+	local results = { pcall(fn, ...) }
 	local success = table.remove(results, 1)
 
 	if not success then
@@ -65,7 +65,7 @@ function SafeCall:Call(fn, ...)
 
 		for _, pattern in ipairs(self._errorFilters) do
 			if string.match(msg, pattern) then
-				return success, results[1] -- Ignore filtered error
+				return false, msg
 			end
 		end
 
@@ -75,11 +75,12 @@ function SafeCall:Call(fn, ...)
 			pcall(handler, msg, debug.traceback())
 		end
 	end
-	return success, unpack(results)
+
+	return success, table.unpack(results)
 end
 
 function SafeCall:CallWithTag(tag, fn, ...)
-	local results = {pcall(fn, ...)}
+	local results = { pcall(fn, ...) }
 	local success = table.remove(results, 1)
 
 	if not success then
@@ -87,19 +88,19 @@ function SafeCall:CallWithTag(tag, fn, ...)
 
 		for _, pattern in ipairs(self._errorFilters) do
 			if string.match(msg, pattern) then
-				return success, results[1] -- Ignore filtered error
+				return false, msg
 			end
 		end
 
-		tag = tag and ("[" .. tag .. "] ") or ""
-		self.Log(tag .. msg)
+		local prefix = tag and ("[" .. tag .. "] ") or ""
+		self.Log(prefix .. msg)
 
 		for _, handler in ipairs(self._globalHandlers) do
-			pcall(handler, msg, debug.traceback(), tag)
+			pcall(handler, msg, debug.traceback(), prefix)
 		end
 	end
 
-	return success, unpack(results)
+	return success, table.unpack(results)
 end
 
 function SafeCall:CallWithRetry(fn, attempts, delay, backoff, ...)
@@ -129,49 +130,39 @@ function SafeCall:CallWithRetry(fn, attempts, delay, backoff, ...)
 	return false, "All retry attempts failed"
 end
 
-function SafeCall:SetPromiseModule(promiseModule)
-	self.Promise = promiseModule
+function SafeCall:SetPromiseModule(promise)
+	self.Promise = promise
 end
 
 function SafeCall:CallAsync(fn, ...)
 	if not self.Promise then
-		error("No Promise module provided. Use SafeCall:SetPromiseModule(Promise)")
+		error("No Promise module provided")
 	end
 
 	local args = { ... }
 
 	return self.Promise.new(function(resolve, reject)
-		local success, result = pcall(fn, table.unpack(args))
-		if success then
-			resolve(result)
-		else
-			self.Log(result)
-			reject(result)
-		end
+		local ok, res = pcall(fn, table.unpack(args))
+		if ok then resolve(res) else reject(res) end
 	end)
 end
 
 function SafeCall:CallWithThread(deferred, fn, ...)
 	local args = { ... }
-	local thread
-
 	if deferred then
-		thread = task.defer(function()
+		return task.defer(function()
 			self:Call(fn, table.unpack(args))
 		end)
 	else
-		thread = task.spawn(function()
+		return task.spawn(function()
 			self:Call(fn, table.unpack(args))
 		end)
 	end
-
-	return thread
 end
 
 function SafeCall:CallDelayed(delay, fn, ...)
-	local args = { ... }
 	task.wait(delay)
-	return self:Call(fn, table.unpack(args))
+	return self:Call(fn, ...)
 end
 
 function SafeCall:ProtectTable(tbl)
@@ -179,13 +170,13 @@ function SafeCall:ProtectTable(tbl)
 	local newMt = oldMt and table.clone(oldMt) or {}
 
 	local oldIndex = oldMt and oldMt.__index or function(self, idx)
-		return self[idx]
+		return rawget(self, idx)
 	end
 
 	local oldCall = oldMt and oldMt.__call or function(self, ...)
 		return self(...)
 	end
-	
+
 	newMt.__index = function(_, idx)
 		local val = oldIndex(tbl, idx)
 
@@ -196,7 +187,7 @@ function SafeCall:ProtectTable(tbl)
 		end
 
 		return val
-	end	
+	end
 
 	newMt.__call = function(_, ...)
 		return select(2, self:Call(oldCall, tbl, ...))
@@ -206,7 +197,7 @@ function SafeCall:ProtectTable(tbl)
 end
 
 function SafeCall:WrapEvent(remote, callback)
-	assert(remote and typeof(callback) == "function", "Invalid arguments for WrapEvent")
+	assert(typeof(callback) == "function", "callback must be a function")
 
 	if remote:IsA("RemoteEvent") then
 		if RunService:IsServer() then
@@ -228,24 +219,24 @@ function SafeCall:WrapEvent(remote, callback)
 end
 
 function SafeCall:WrapFunction(remote, callback)
-	assert(remote and typeof(callback) == "function", "Invalid arguments for WrapFunction")
+	assert(typeof(callback) == "function", "callback must be a function")
 
 	if remote:IsA("RemoteFunction") then
 		if RunService:IsServer() then
 			remote.OnServerInvoke = function(player, ...)
-				local success, result = self:Call(callback, player, ...)
-				return success and result or nil
+				local ok, res = self:Call(callback, player, ...)
+				return ok and res or nil
 			end
 		else
 			remote.OnClientInvoke = function(...)
-				local success, result = self:Call(callback, ...)
-				return success and result or nil
+				local ok, res = self:Call(callback, ...)
+				return ok and res or nil
 			end
 		end
 	elseif remote:IsA("BindableFunction") then
 		remote.OnInvoke = function(...)
-			local success, result = self:Call(callback, ...)
-			return success and result or nil
+			local ok, res = self:Call(callback, ...)
+			return ok and res or nil
 		end
 	else
 		error("Expected RemoteFunction or BindableFunction")
@@ -262,20 +253,18 @@ end
 
 function SafeCall:CallWithTimeout(timeout, fn, ...)
 	local args = { ... }
-	local completed = false
+	local done = false
 	local result
 
 	task.spawn(function()
 		result = { self:Call(fn, table.unpack(args)) }
-		completed = true
+		done = true
 	end)
 
-	local startTime = tick()
-	while not completed and (tick() - startTime) < timeout do
-		task.wait()
-	end
+	local start = tick()
+	while not done and tick() - start < timeout do task.wait() end
 
-	if completed then
+	if done then
 		return table.unpack(result)
 	else
 		self.Log("Function call timed out after " .. timeout .. " seconds")
@@ -289,41 +278,39 @@ function SafeCall:CreateCircuitBreaker(threshold, resetTime)
 		threshold = threshold or 5,
 		resetTime = resetTime or 30,
 		lastFailure = 0,
-		state = "CLOSED", -- CLOSED, OPEN, HALF_OPEN
+		state = "CLOSED",
 	}
 end
 
 function SafeCall:CallWithCircuitBreaker(breaker, fn, ...)
 	local now = tick()
 
-	if breaker.state == "OPEN" and (now - breaker.lastFailure) > breaker.resetTime then
+	if breaker.state == "OPEN" and now - breaker.lastFailure > breaker.resetTime then
 		breaker.state = "HALF_OPEN"
 		breaker.failures = 0
 	end
 
 	if breaker.state == "OPEN" then
-		self.Log("Circuit breaker is OPEN - rejecting call")
+		self.Log("Circuit breaker is OPEN")
 		return false, "Circuit breaker open"
 	end
 
-	local success, result = self:Call(fn, ...)
+	local ok, res = self:Call(fn, ...)
 
-	if success then
-		if breaker.state == "HALF_OPEN" then
-			breaker.state = "CLOSED"
-		end
+	if ok then
+		if breaker.state == "HALF_OPEN" then breaker.state = "CLOSED" end
 		breaker.failures = 0
 	else
-		breaker.failures = breaker.failures + 1
+		breaker.failures += 1
 		breaker.lastFailure = now
 
 		if breaker.failures >= breaker.threshold then
-			self.Log(string.format("Circuit breaker OPENED after %d failures", breaker.failures))
 			breaker.state = "OPEN"
+			self.Log("Circuit breaker OPENED")
 		end
 	end
 
-	return success, result
+	return ok, res
 end
 
 function SafeCall:CreateRateLimiter(maxCalls, timeWindow)
@@ -338,7 +325,7 @@ function SafeCall:CallWithRateLimit(limiter, fn, ...)
 	local now = tick()
 
 	for i = #limiter.calls, 1, -1 do
-		if (now - limiter.calls[i]) > limiter.timeWindow then
+		if now - limiter.calls[i] > limiter.timeWindow then
 			table.remove(limiter.calls, i)
 		end
 	end
@@ -358,8 +345,9 @@ function SafeCall:ConnectSafe(signal, callback, options)
 	local connectOnce = options.connectOnce
 
 	local connection
+
 	if connectOnce then
-		connection = signal:Once(function(...)
+		connection = signal:ConnectOnce(function(...)
 			if weakRef and not weakRef.Parent then
 				connection:Disconnect()
 				return
@@ -377,6 +365,7 @@ function SafeCall:ConnectSafe(signal, callback, options)
 			self:Call(callback, ...)
 		end)
 	end
+
 	return connection
 end
 
@@ -385,20 +374,21 @@ function SafeCall:Memoize(fn, ttl)
 	ttl = ttl or math.huge
 
 	return function(...)
-		local rawArgs = { ... }
-		local parts = {}
-		for i, v in ipairs(rawArgs) do
-			parts[i] = typeof(v) .. ":" .. tostring(v)
+		local args = { ... }
+		local keyParts = {}
+
+		for i, v in ipairs(args) do
+			keyParts[i] = typeof(v) .. ":" .. tostring(v)
 		end
 
-		local key = table.concat(parts, "|")
+		local key = table.concat(keyParts, "|")
 		local entry = cache[key]
 
-		if entry and (tick() - entry.time) < ttl then
+		if entry and tick() - entry.time < ttl then
 			return entry.success, entry.result
 		end
 
-		local success, result = self:Call(fn, table.unpack(rawArgs))
+		local success, result = self:Call(fn, table.unpack(args))
 		cache[key] = {
 			success = success,
 			result = result,
@@ -423,30 +413,24 @@ function SafeCall:CallWithProfiler(profiler, fn, ...)
 	local start = tick()
 	profiler.calls += 1
 
-	local success, result = self:Call(fn, ...)
+	local ok, res = self:Call(fn, ...)
+	local dt = tick() - start
 
-	local duration = tick() - start
-	profiler.totalTime += duration
+	profiler.totalTime += dt
+	if not ok then profiler.errors += 1 end
+	if dt > profiler.slowThreshold then profiler.slowCalls += 1 end
 
-	if not success then
-		profiler.errors += 1
-	end
-
-	if duration > profiler.slowThreshold then
-		profiler.slowCalls += 1
-	end
-
-	return success, result
+	return ok, res
 end
 
-function SafeCall:GetProfilerStats(profiler)
+function SafeCall:GetProfilerStats(p)
 	return {
-		calls = profiler.calls,
-		errors = profiler.errors,
-		errorRate = profiler.calls > 0 and (profiler.errors / profiler.calls) or 0,
-		avgTime = profiler.calls > 0 and (profiler.totalTime / profiler.calls) or 0,
-		slowCalls = profiler.slowCalls,
-		slowCallRate = profiler.calls > 0 and (profiler.slowCalls / profiler.calls) or 0,
+		calls = p.calls,
+		errors = p.errors,
+		errorRate = p.calls > 0 and (p.errors / p.calls) or 0,
+		avgTime = p.calls > 0 and (p.totalTime / p.calls) or 0,
+		slowCalls = p.slowCalls,
+		slowCallRate = p.calls > 0 and (p.slowCalls / p.calls) or 0,
 	}
 end
 
@@ -464,15 +448,12 @@ function SafeCall:RemoveGlobalHandler(handler)
 end
 
 function SafeCall:Schedule(name, interval, fn)
-	if self._taskScheduler[name] then
-		return
-	end
-
+	if self._taskScheduler[name] then return end
 	self._taskScheduler[name] = true
 
 	task.spawn(function()
 		while self._taskScheduler[name] do
-			self:CallWithTag(fn, name)
+			self:CallWithTag(name, fn)
 			task.wait(interval)
 		end
 	end)
